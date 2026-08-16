@@ -47,12 +47,14 @@ router.post(
                 });
             }
 
-            const {
-                task_id,
-                status,
-                file_url
-            } =
-                parsed.data;
+        const {
+    task_id,
+    status,
+    file_url,
+    output_text,
+    text,
+    result_text
+} = parsed.data;
 
             if (
                 status === 'success' &&
