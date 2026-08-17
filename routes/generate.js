@@ -8,7 +8,7 @@ const {authenticateUser}=require('../middlewares/auth');
 const {requireActiveSubscription,requirePositiveBalance}=require('../middlewares/subscription');
 const {secureUpload,ethicalFilter,cleanupUploadedFiles}=require('../middlewares/uploadSecurity');
 const {STORAGE_ENABLED,AUTO_UPLOAD_TO_SPACES,makeSafeStorageKey,uploadLocalFileToSpaces,createStorageReferenceUrl}=require('../services/storage');
-const {getPoyoModel,buildPoyoInput}=require('../services/poyoAdapter');
+const {getPoyoModel,buildPoyoInput}= require('./poyoAdapter');
 const router=express.Router();
 
 router.post(
