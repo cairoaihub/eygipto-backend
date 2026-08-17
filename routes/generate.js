@@ -8,6 +8,7 @@ const {authenticateUser}=require('../middlewares/auth');
 const {requireActiveSubscription,requirePositiveBalance}=require('../middlewares/subscription');
 const {secureUpload,ethicalFilter,cleanupUploadedFiles}=require('../middlewares/uploadSecurity');
 const {STORAGE_ENABLED,AUTO_UPLOAD_TO_SPACES,makeSafeStorageKey,uploadLocalFileToSpaces,createStorageReferenceUrl}=require('../services/storage');
+const {getPoyoModel,buildPoyoInput}=require('../services/poyoAdapter');
 const router=express.Router();
 
 router.post(
@@ -193,16 +194,28 @@ router.post(
             // إرسال المهمة إلى Make
             // ======================================
 
+            const poyoModel = getPoyoModel(modelName);
+
+            if (!poyoModel) {
+                if (pointsCost > 0) {
+                    const { error: refundErr } = await supabase.rpc(
+                        'atomic_restore_points',
+                        { p_user_id: userId, p_amount: pointsCost, p_task_id: task.id }
+                    );
+                    if (refundErr) console.error(`CRITICAL: Refund failed for unsupported model ${task.id}`, refundErr);
+                }
+                await supabase.from('tasks').update({ status: 'failed', updated_at: new Date() }).eq('id', task.id).eq('status', 'processing');
+                await cleanupUploadedFiles(req);
+                return res.status(400).json({ error: `الموديل ${modelName} غير مهيأ لمسار PoYo الحالي.` });
+            }
+
             const makePayload = {
-                task_id:
-                    task.id,
-
+                task_id: task.id,
                 prompt,
-
-                model:
-                    modelName,
-
-                style
+                model: modelName,
+                poyo_model: poyoModel,
+                style,
+                callback_url: process.env.POYO_CALLBACK_URL
             };
 
             // الملفات المرجعية بعد اجتياز الفحص الأمني تُحفظ في Spaces،
@@ -242,6 +255,26 @@ router.post(
                 makePayload.reference_files = referenceFiles;
             }
 
+            try {
+                makePayload.poyo_input_json = buildPoyoInput({
+                    modelName,
+                    prompt,
+                    style,
+                    referenceFiles
+                });
+            } catch (adapterError) {
+                if (pointsCost > 0) {
+                    const { error: refundErr } = await supabase.rpc(
+                        'atomic_restore_points',
+                        { p_user_id: userId, p_amount: pointsCost, p_task_id: task.id }
+                    );
+                    if (refundErr) console.error(`CRITICAL: Refund failed after adapter error ${task.id}`, refundErr);
+                }
+                await supabase.from('tasks').update({ status: 'failed', updated_at: new Date() }).eq('id', task.id).eq('status', 'processing');
+                await cleanupUploadedFiles(req);
+                return res.status(400).json({ error: adapterError.message || 'إعدادات الموديل غير صالحة.' });
+            }
+
             /*
              * لا نرسل مفاتيح Poyo إلى الواجهة
              * ولا إلى المستخدم.
@@ -261,78 +294,98 @@ router.post(
                     outputTokens;
             }
 
-            axios
-                .post(
+            let makeResponse;
+
+            try {
+                makeResponse = await axios.post(
                     process.env.MAKE_WEBHOOK_IMAGE_GEN,
                     makePayload,
                     {
-                        timeout: 30000
-                    }
-                )
-                .catch(
-                    async (err) => {
-
-                        console.error(
-                            "Make.com API Error/Timeout. Refunding..."
-                        );
-
-                        const {
-                            data:
-                                updatedTask
-                        } =
-                            await supabase
-                                .from('tasks')
-                                .update({
-                                    status:
-                                        'failed',
-
-                                    updated_at:
-                                        new Date()
-                                })
-                                .eq(
-                                    'id',
-                                    task.id
-                                )
-                                .eq(
-                                    'status',
-                                    'processing'
-                                )
-                                .select()
-                                .single();
-
-                        if (
-                            updatedTask
-                        ) {
-
-                            if (pointsCost > 0) {
-                                const {
-                                    error:
-                                        refundErr
-                                } =
-                                    await supabase.rpc(
-                                        'atomic_restore_points',
-                                        {
-                                            p_user_id:
-                                                userId,
-
-                                            p_amount:
-                                                pointsCost,
-
-                                            p_task_id:
-                                                task.id
-                                        }
-                                    );
-
-                                if (refundErr) {
-                                    console.error(
-                                        `CRITICAL: Refund failed after Make error ${task.id}`,
-                                        refundErr
-                                    );
-                                }
-                            }
+                        timeout: 25000,
+                        headers: {
+                            'Content-Type': 'application/json',
+                            ...(process.env.MAKE_WEBHOOK_API_KEY
+                                ? { 'x-make-apikey': process.env.MAKE_WEBHOOK_API_KEY }
+                                : {})
                         }
                     }
                 );
+            } catch (err) {
+                console.error('Make.com API Error/Timeout. Refunding...', err.message);
+
+                const { data: updatedTask } = await supabase
+                    .from('tasks')
+                    .update({ status: 'failed', updated_at: new Date() })
+                    .eq('id', task.id)
+                    .eq('status', 'processing')
+                    .select()
+                    .single();
+
+                if (updatedTask && pointsCost > 0) {
+                    const { error: refundErr } = await supabase.rpc(
+                        'atomic_restore_points',
+                        { p_user_id: userId, p_amount: pointsCost, p_task_id: task.id }
+                    );
+                    if (refundErr) console.error(`CRITICAL: Refund failed after Make error ${task.id}`, refundErr);
+                }
+
+                await cleanupUploadedFiles(req);
+                return res.status(502).json({ error: 'تعذر إرسال مهمة التوليد إلى خدمة المعالجة.' });
+            }
+
+            const poyoTaskId = makeResponse?.data?.poyo_task_id;
+
+            if (!poyoTaskId || typeof poyoTaskId !== 'string') {
+                console.error('Make response missing poyo_task_id:', makeResponse?.data);
+
+                const { data: updatedTask } = await supabase
+                    .from('tasks')
+                    .update({ status: 'failed', updated_at: new Date() })
+                    .eq('id', task.id)
+                    .eq('status', 'processing')
+                    .select()
+                    .single();
+
+                if (updatedTask && pointsCost > 0) {
+                    const { error: refundErr } = await supabase.rpc(
+                        'atomic_restore_points',
+                        { p_user_id: userId, p_amount: pointsCost, p_task_id: task.id }
+                    );
+                    if (refundErr) console.error(`CRITICAL: Refund failed for ${task.id}`, refundErr);
+                }
+
+                await cleanupUploadedFiles(req);
+                return res.status(502).json({ error: 'لم يتم استلام رقم مهمة PoYo من Make.' });
+            }
+
+            const { error: poyoTaskUpdateError } = await supabase
+                .from('tasks')
+                .update({ poyo_task_id: poyoTaskId, updated_at: new Date() })
+                .eq('id', task.id)
+                .eq('status', 'processing');
+
+            if (poyoTaskUpdateError) {
+                console.error(`Failed to save PoYo task ID for ${task.id}:`, poyoTaskUpdateError);
+
+                const { data: updatedTask } = await supabase
+                    .from('tasks')
+                    .update({ status: 'failed', updated_at: new Date() })
+                    .eq('id', task.id)
+                    .eq('status', 'processing')
+                    .select()
+                    .single();
+
+                if (updatedTask && pointsCost > 0) {
+                    const { error: refundErr } = await supabase.rpc(
+                        'atomic_restore_points',
+                        { p_user_id: userId, p_amount: pointsCost, p_task_id: task.id }
+                    );
+                    if (refundErr) console.error(`CRITICAL: Refund failed for ${task.id}`, refundErr);
+                }
+
+                await cleanupUploadedFiles(req);
+                return res.status(500).json({ error: 'تعذر حفظ مهمة PoYo.' });
+            }
 
             await cleanupUploadedFiles(req);
 
