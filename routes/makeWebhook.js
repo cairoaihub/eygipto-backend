@@ -203,4 +203,160 @@ router.post(
     }
 );
 
+
+// ==========================================
+// PoYo.ai direct callback
+// PoYo -> Backend (Make is not involved here)
+// ==========================================
+
+const extractPoyoTaskData = (payload) => {
+    // PoYo's unified generation webhook uses { code, data: {...} }.
+    // Some music webhooks may arrive as the inner object directly, so support both.
+    return payload?.data && typeof payload.data === 'object'
+        ? payload.data
+        : payload || {};
+};
+
+const findResultUrl = (files = []) => {
+    for (const file of Array.isArray(files) ? files : []) {
+        const candidates = [
+            file?.file_url,
+            file?.image_url,
+            file?.video_url,
+            file?.audio_url,
+            file?.wav_url,
+            file?.thumbnail
+        ];
+        const url = candidates.find(value => typeof value === 'string' && /^https:\/\//i.test(value));
+        if (url) return url;
+    }
+    return null;
+};
+
+const processPoyoCallback = async (payload) => {
+    const data = extractPoyoTaskData(payload);
+    const poyoTaskId = data.task_id;
+    const status = data.status;
+    const files = Array.isArray(data.files) ? data.files : [];
+    const errorMessage = data.error_message || null;
+
+    if (!poyoTaskId || !status) {
+        throw new Error('PoYo callback is missing task_id or status.');
+    }
+
+    const { data: task, error: findError } = await supabase
+        .from('tasks')
+        .select('id,user_id,status,points_cost')
+        .eq('poyo_task_id', poyoTaskId)
+        .maybeSingle();
+
+    if (findError) {
+        throw new Error(`Failed to find task for PoYo task ${poyoTaskId}: ${findError.message}`);
+    }
+
+    // Unknown callbacks are acknowledged but not allowed to mutate data.
+    if (!task) {
+        console.warn(`PoYo callback received for unknown task: ${poyoTaskId}`);
+        return;
+    }
+
+    // Idempotency: retries or duplicate callbacks must not double-refund or overwrite a final task.
+    if (task.status !== 'processing') {
+        console.log(`PoYo callback already processed for ${poyoTaskId}; status=${task.status}`);
+        return;
+    }
+
+    if (status === 'finished') {
+        const resultUrl = findResultUrl(files);
+
+        if (!resultUrl) {
+            throw new Error(`PoYo task ${poyoTaskId} finished without a supported result URL.`);
+        }
+
+        let storedFileUrl = resultUrl;
+
+        if (AUTO_UPLOAD_TO_SPACES) {
+            const storageKey = await uploadResultUrlToSpaces(
+                resultUrl,
+                `generated/${task.id}`
+            );
+
+            if (storageKey) {
+                storedFileUrl = `spaces://${storageKey}`;
+            }
+        }
+
+        const { data: updatedTask, error: updateError } = await supabase
+            .from('tasks')
+            .update({
+                status: 'success',
+                file_url: storedFileUrl,
+                output_text: data.output_text || data.text || data.result_text || null,
+                updated_at: new Date()
+            })
+            .eq('id', task.id)
+            .eq('status', 'processing')
+            .select('id')
+            .maybeSingle();
+
+        if (updateError) {
+            throw new Error(`Failed to update completed task ${task.id}: ${updateError.message}`);
+        }
+
+        if (!updatedTask) {
+            console.log(`Task ${task.id} was finalized by another callback.`);
+        }
+
+        return;
+    }
+
+    if (status === 'failed') {
+        const { data: failedTask, error: updateError } = await supabase
+            .from('tasks')
+            .update({
+                status: 'failed',
+                output_text: errorMessage,
+                updated_at: new Date()
+            })
+            .eq('id', task.id)
+            .eq('status', 'processing')
+            .select('id,user_id,points_cost')
+            .maybeSingle();
+
+        if (updateError) {
+            throw new Error(`Failed to mark task ${task.id} as failed: ${updateError.message}`);
+        }
+
+        if (failedTask && Number(failedTask.points_cost || 0) > 0) {
+            const { error: refundError } = await supabase.rpc(
+                'atomic_restore_points',
+                {
+                    p_user_id: failedTask.user_id,
+                    p_amount: Number(failedTask.points_cost),
+                    p_task_id: task.id
+                }
+            );
+
+            if (refundError) {
+                console.error(`CRITICAL: Refund failed for PoYo callback ${task.id}`, refundError);
+            }
+        }
+    }
+};
+
+router.post(
+    '/api/webhook/poyo-result',
+    async (req, res) => {
+        // PoYo requires a fast 2xx acknowledgement (within 10 seconds).
+        // Heavy work such as downloading to Spaces happens after acknowledgement.
+        res.status(200).json({ received: true });
+
+        setImmediate(() => {
+            processPoyoCallback(req.body).catch(error => {
+                console.error('PoYo Callback Processing Error:', error);
+            });
+        });
+    }
+);
+
 module.exports=router;
