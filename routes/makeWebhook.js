@@ -77,7 +77,7 @@ router.post(
 );
 
 // ==========================================
-// PoYo.ai direct callback
+// PoYo.ai direct callback (Fixed & Secured)
 // ==========================================
 
 const extractPoyoTaskData = (payload) => {
@@ -102,7 +102,6 @@ const processPoyoCallback = async (payload, myTaskId) => {
 
     if (!status) throw new Error('PoYo callback is missing status.');
 
-    // البحث عن المهمة باستخدام myTaskId (إذا توفر) أو poyoTaskId
     let query = supabase.from('tasks').select('id,user_id,status,points_cost');
     
     if (myTaskId) {
@@ -156,16 +155,16 @@ const processPoyoCallback = async (payload, myTaskId) => {
 };
 
 router.post('/api/webhook/poyo-result', async (req, res) => {
-    res.status(200).json({ received: true });
-
-    // استخراج my_task_id من رابط الـ Query
     const myTaskId = req.query.my_task_id;
+    console.log(`📥 PoYo Callback hit! Query my_task_id: ${myTaskId || 'NOT_PROVIDED'}`);
 
-    setImmediate(() => {
-        processPoyoCallback(req.body, myTaskId).catch(error => {
-            console.error('PoYo Callback Processing Error:', error);
-        });
-    });
+    try {
+        await processPoyoCallback(req.body, myTaskId);
+        return res.status(200).json({ received: true });
+    } catch (error) {
+        console.error('❌ PoYo Callback Error:', error.message);
+        return res.status(500).json({ error: error.message });
+    }
 });
 
 module.exports = router;
