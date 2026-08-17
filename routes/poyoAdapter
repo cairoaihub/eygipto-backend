@@ -1,0 +1,185 @@
+// PoYo adapter for the model IDs exposed by the current website.
+// The website model IDs remain unchanged; this file maps them to PoYo IDs
+// and builds the unified async input object used by Make -> PoYo.
+
+const POYO_MODEL_MAP = {
+    'kling-o3-image': 'kling-o3-image',
+    'seedream-5.0-pro': 'seedream-5.0-pro',
+    'nano-banana-2-official': 'nano-banana-2-official',
+    'grok-imagine-image': 'grok-imagine-image',
+    'seedance-1.0-pro-720p': 'seedance-1.0-pro',
+    'seedance-1.0-pro-1080p': 'seedance-1.0-pro',
+    'kling-3.0-motion-control-720p': 'kling-3.0-motion-control',
+    'kling-3.0-motion-control-1080p': 'kling-3.0-motion-control',
+    'omni-flash': 'omni-flash',
+    'sora-2-official': 'sora-2-official',
+    'generate-music': 'generate-music',
+    'extend-music': 'extend-music'
+};
+
+const parseStyle = (style = '') => {
+    if (!style) return {};
+
+    if (typeof style === 'object' && style !== null) {
+        return style;
+    }
+
+    const raw = String(style).trim();
+    if (!raw) return {};
+
+    try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            return parsed;
+        }
+    } catch (_) {}
+
+    const out = {};
+    for (const item of raw.split(';')) {
+        const index = item.indexOf('=');
+        if (index < 0) continue;
+        const key = item.slice(0, index).trim();
+        const value = item.slice(index + 1).trim();
+        if (key && value) out[key] = value;
+    }
+    return out;
+};
+
+const numberOr = (value, fallback) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+};
+
+const durationOr = (value, fallback) => {
+    const match = String(value ?? '').match(/\d+(?:\.\d+)?/);
+    return match ? numberOr(match[0], fallback) : fallback;
+};
+
+const normalizeAspect = (value, fallback = '1:1') => {
+    return /^\d+:\d+$/.test(String(value || '')) ? String(value) : fallback;
+};
+
+const getResolution = (modelName, opts) => {
+    const explicit = String(opts.resolution || opts.quality || '').toLowerCase();
+    if (explicit.includes('4k')) return '4K';
+    if (explicit.includes('2k')) return '2K';
+    if (explicit.includes('1080')) return '1080p';
+    if (explicit.includes('1024')) return '1024p';
+    if (explicit.includes('720')) return '720p';
+    if (explicit.includes('1k')) return '1K';
+    if (/1080p/i.test(modelName)) return '1080p';
+    if (/720p/i.test(modelName)) return '720p';
+    return null;
+};
+
+const imageUrls = (referenceFiles = []) => referenceFiles
+    .filter(file => file?.url && String(file.type || '').startsWith('image/'))
+    .map(file => file.url);
+
+const videoUrls = (referenceFiles = []) => referenceFiles
+    .filter(file => file?.url && String(file.type || '').startsWith('video/'))
+    .map(file => file.url);
+
+const buildPoyoInput = ({ modelName, prompt, style, referenceFiles = [] }) => {
+    const opts = parseStyle(style);
+    const aspect = normalizeAspect(opts.aspect_ratio || opts.aspectRatio, '16:9');
+    const resolution = getResolution(modelName, opts);
+    const input = { prompt: String(prompt || '') };
+    const images = imageUrls(referenceFiles);
+    const videos = videoUrls(referenceFiles);
+
+    switch (modelName) {
+        case 'kling-o3-image':
+            input.size = normalizeAspect(opts.aspect_ratio || opts.size, '1:1');
+            input.resolution = resolution || '1K';
+            input.output_format = opts.output_format || 'png';
+            input.n = Math.min(Math.max(numberOr(opts.n, 1), 1), 9);
+            if (images.length) input.image_urls = images.slice(0, 10);
+            break;
+
+        case 'seedream-5.0-pro':
+            input.size = normalizeAspect(opts.aspect_ratio || opts.size, '1:1');
+            input.resolution = resolution === '2K' || resolution === '4K' ? resolution : '1K';
+            input.n = Math.min(Math.max(numberOr(opts.n, 1), 1), 15);
+            if (images.length) input.image_urls = images.slice(0, 14);
+            break;
+
+        case 'nano-banana-2-official':
+            input.size = opts.size || normalizeAspect(opts.aspect_ratio, '1:1');
+            input.resolution = resolution || '1K';
+            if (images.length) input.image_urls = images.slice(0, 14);
+            break;
+
+        case 'grok-imagine-image':
+            input.size = normalizeAspect(opts.aspect_ratio || opts.size, '16:9');
+            if (images.length === 1) input.image_urls = [images[0]];
+            break;
+
+        case 'seedance-1.0-pro-720p':
+        case 'seedance-1.0-pro-1080p':
+            input.resolution = resolution || (modelName.endsWith('1080p') ? '1080p' : '720p');
+            input.duration = durationOr(opts.duration, 5);
+            if (images.length) input.image_urls = [images[0]];
+            break;
+
+        case 'kling-3.0-motion-control-720p':
+        case 'kling-3.0-motion-control-1080p':
+            input.resolution = resolution || (modelName.endsWith('1080p') ? '1080p' : '720p');
+            if (images.length) input.image_urls = [images[0]];
+            if (videos.length) input.video_urls = [videos[0]];
+            input.character_orientation = opts.character_orientation || 'image';
+            break;
+
+        case 'omni-flash':
+            input.aspect_ratio = aspect;
+            input.resolution = resolution || '720p';
+            input.duration = durationOr(opts.duration, 10);
+            if (images.length) input.image_urls = images.slice(0, 3);
+            break;
+
+        case 'sora-2-official':
+            input.duration = [4, 8, 12, 16, 20].includes(numberOr(opts.duration, 4))
+                ? numberOr(opts.duration, 4)
+                : 4;
+            input.aspect_ratio = normalizeAspect(opts.aspect_ratio, '16:9');
+            if (images.length === 1) input.image_urls = [images[0]];
+            break;
+
+        case 'generate-music':
+            input.style = String(opts.music_style || opts.style || '');
+            input.title = String(opts.title || prompt || 'Untitled');
+            input.custom_mode = true;
+            input.instrumental = opts.instrumental !== false;
+            input.mv = opts.mv || 'V5_5';
+            if (opts.negative_tags) input.negative_tags = String(opts.negative_tags);
+            if (opts.style_weight !== undefined) input.style_weight = numberOr(opts.style_weight, 0.65);
+            break;
+
+        case 'extend-music':
+            if (!opts.audio_id) {
+                throw new Error('extend-music يحتاج audio_id من المسار الصوتي السابق.');
+            }
+            input.audio_id = String(opts.audio_id);
+            input.default_param_flag = true;
+            input.style = String(opts.music_style || opts.style || '');
+            input.title = String(opts.title || prompt || 'Extended Track');
+            input.continue_at = numberOr(opts.continue_at, 0);
+            input.mv = opts.mv || 'V5_5';
+            if (opts.negative_tags) input.negative_tags = String(opts.negative_tags);
+            break;
+
+        default:
+            throw new Error(`No PoYo adapter configured for model: ${modelName}`);
+    }
+
+    return input;
+};
+
+const getPoyoModel = (modelName) => POYO_MODEL_MAP[modelName] || null;
+
+module.exports = {
+    POYO_MODEL_MAP,
+    parseStyle,
+    buildPoyoInput,
+    getPoyoModel
+};
